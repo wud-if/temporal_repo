@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>WindowJoin 核心调用链 — Flink 原生 vs Flink-Gluten-Velox</title>
+<style>
+  :root {
+    --fn: #1a56b0; --phase: #6b21a8; --data: #0f766e; --fix: #dc2626;
+    --warn: #d97706; --jni: #be185d; --border: #d4d4d8; --bg: #fafafa;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f4f4f5; color: #27272a; }
+  header { background: #18181b; color: #fff; padding: 14px 24px; position: sticky; top: 0; z-index: 10;
+           display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .btn { background: #3f3f46; color: #fff; border: 1px solid #52525b; border-radius: 6px;
+         padding: 5px 12px; font-size: 13px; cursor: pointer; }
+  .btn:hover { background: #52525b; }
+  .legend { display: flex; gap: 14px; font-size: 12px; margin-left: auto; flex-wrap: wrap; }
+  .legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px 24px 80px; }
+  .chain { background: #fff; border: 1px solid var(--border); border-radius: 10px;
+           margin-bottom: 28px; overflow: hidden; }
+  .chain > h2 { margin: 0; padding: 14px 20px; font-size: 16px; cursor: pointer;
+                user-select: none; border-bottom: 1px solid var(--border); }
+  .chain > h2 .arrow { margin-right: 8px; display: inline-block; transition: .15s; }
+  .chain.collapsed > h2 .arrow { transform: rotate(-90deg); }
+  .chain.collapsed .body { display: none; }
+  .body { padding: 14px 20px 20px; }
+  .node { margin-left: 0; }
+  .children { margin-left: 22px; border-left: 2px solid var(--border);
+              padding-left: 14px; margin-top: 4px; }
+  .node.collapsed > .children { display: none; }
+  .row { display: flex; align-items: baseline; gap: 8px; padding: 3px 4px; border-radius: 5px;
+         cursor: pointer; flex-wrap: wrap; }
+  .row:hover { background: #f0f4ff; }
+  .toggle { width: 14px; color: #71717a; font-size: 11px; flex: none; }
+  .row.leaf .toggle { visibility: hidden; }
+  .name { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13.5px; font-weight: 600; }
+  .loc { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #71717a;
+         background: #f4f4f5; border-radius: 4px; padding: 1px 6px; }
+  .badge { font-size: 11px; border-radius: 4px; padding: 1px 7px; font-weight: 600; }
+  .fix   { color: #fff; background: var(--fix); }
+  .warn  { color: #fff; background: var(--warn); }
+  .jni   { color: #fff; background: var(--jni); }
+  .desc { flex-basis: 100%; margin: 1px 0 4px 22px; font-size: 12.5px; color: #52525b; }
+  .t-fn    .name { color: var(--fn); }
+  .t-phase .name { color: var(--phase); }
+  .t-data  .name { color: var(--data); font-weight: 500; }
+  .t-jni   .name { color: var(--jni); }
+  .note { margin: 10px 0; padding: 8px 14px; border-radius: 6px; font-size: 12.5px;
+          background: #fffbeb; border: 1px solid #fde68a; color: #92400e; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; }
+  th, td { border: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f4f4f5; }
+  code { font-family: ui-monospace, Consolas, monospace; font-size: 12px; background: #f4f4f5;
+         padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>WindowJoin 核心调用链</h1>
+  <button class="btn" onclick="setAll(false)">全部收起</button>
+  <button class="btn" onclick="setAll(true)">全部展开</button>
+  <div class="legend">
+    <span><i class="dot" style="background:#6b21a8"></i>阶段/入口</span>
+    <span><i class="dot" style="background:#1a56b0"></i>函数</span>
+    <span><i class="dot" style="background:#0f766e"></i>数据/动作</span>
+    <span><i class="dot" style="background:#be185d"></i>JNI 分界</span>
+    <span><i class="dot" style="background:#dc2626"></i>待修</span>
+    <span><i class="dot" style="background:#d97706"></i>待核实</span>
+  </div>
+</header>
+<main id="root"></main>
+
+<script>
+const DATA = [
+{ title: "A. Flink 原生调用链", note: "语义契约基准：push 行级驱动；状态粒度为行；join 语义由 6 个子类显式实现。", children: [
+  { name: "A1. 编译期：SQL → Transformation", type: "phase", children: [
+    { name: "SQL 入口", type: "data", desc: "FROM (TVF+GROUP BY) P JOIN (TVF+GROUP BY) A ON id=seller AND window_start/window_end 等值", children: [
+      { name: "StreamPhysicalWindowJoinRule.matches", loc: "StreamPhysicalWindowJoinRule.scala:41", type: "fn", desc: "规则触发判定入口。", children: [
+        { name: "WindowJoinUtil.satisfyWindowJoin", loc: "WindowJoinUtil.scala:62", type: "fn", desc: "检查 join 条件同时含两侧 window_start 与 window_end 等值——决定能否转窗口 join。" } ] },
+      { name: "StreamPhysicalWindowJoinRule.onMatch", loc: "StreamPhysicalWindowJoinRule.scala:45", type: "fn", desc: "命中后的转换主流程。", children: [
+        { name: "excludeWindowStartEqualityAndEndEqualityFromWindowJoinCondition", loc: "WindowJoinUtil.scala:88", type: "fn", desc: "从 join 条件剥离窗口等值，产出两侧 WindowAttachedWindowingStrategy（只剩窗口列下标）与剩余 JoinSpec。" },
+        { name: "convertInput", type: "fn", desc: "按剩余等值键要求两侧 hash 分布；键为空时退化为 SINGLETON（q5 场景）。" },
+        { name: "new StreamPhysicalWindowJoin", type: "fn", desc: "生成物理节点（joinType + 剩余条件 + 两侧 windowing）。" } ] },
+      { name: "StreamExecWindowJoin.translateToPlanInternal", loc: "StreamExecWindowJoin.java:139", type: "fn", desc: "物理节点到 Transformation 的翻译。", children: [
+        { name: "validate", loc: ":142", type: "fn", desc: "校验仅支持事件时间与窗口附着策略，proctime 直接抛错。" },
+        { name: "JoinUtil.generateConditionFunction", type: "fn", desc: "把剩余条件（等值键之外的所有条件，含非等值如 num>=maxn）codegen 为 GeneratedJoinCondition。" },
+        { name: "WindowJoinOperatorBuilder.build()", type: "fn", desc: "按 joinType 分派构建 6 种算子子类（Inner/Left/Right/Full/SemiAnti）。" },
+        { name: "TwoInputTransformation + setStateKeySelectors", loc: ":244-266", type: "data", desc: "建双输入 Transformation，并按剩余键设置状态 key 选择器（Flink 层 keyBy）。" } ] } ] } ] },
+  { name: "A2. 运行期：数据面", type: "phase", children: [
+    { name: "上游供给：窗口聚合结算", type: "phase", desc: "水位线到达 windowEnd 时聚合结算，产出携带 window_start/end 的行——join 的输入。", children: [
+      { name: "WindowAggOperator.onEventTime", type: "fn", desc: "水位线触发的窗口结算入口。" },
+      { name: "WindowProcessor.fireWindow", type: "fn", desc: "按窗口类型分派结算策略。", children: [
+        { name: "SliceUnsharedProcessor（tumble）", type: "fn", desc: "窗口即切片：直接取窗口累积器 getValue 输出。" },
+        { name: "SliceSharedProcessor（hop/cumulate）", type: "fn", desc: "mergeSlices 合并覆盖的所有切片累积器后输出（状态 O(slice)）。" },
+        { name: "UnsliceProcessor（session）", type: "fn", desc: "经 MergingWindowProcessFunction 输出动态合并后的会话窗口。" } ] },
+      { name: "collect + 转发水位线", type: "data", desc: "先发结算数据再转发水位线——算子契约保证 join 侧数据先于水位线到达。" } ] },
+    { name: "WindowJoinOperator：入桶", type: "phase", children: [
+      { name: "processElement1 / processElement2", loc: "WindowJoinOperator.java:203/208", type: "fn", desc: "左右流输入入口，转发到统一处理。" },
+      { name: "processElement", loc: ":212", type: "fn", desc: "单行处理主流程。", children: [
+        { name: "row.getLong(windowEndIndex)", loc: ":219", type: "data", desc: "直接从行内窗口列读出 windowEnd。" },
+        { name: "isWindowFired", loc: ":220", type: "fn", desc: "迟到判定：水位线已过 windowEnd 则丢行并计数。" },
+        { name: "recordState.add(windowEnd, row)", loc: ":226", type: "data", desc: "行入桶：key=剩余 join 键（可为空），namespace=windowEnd，行级 ListState。" },
+        { name: "registerEventTimeWindowTimer", loc: ":233", type: "fn", desc: "每行注册事件时间定时器 @windowEnd。" } ] } ] },
+    { name: "水位线推进 → 定时器 → 配对 → 清桶", type: "phase", children: [
+      { name: "onEventTime(timer)", loc: ":244", type: "fn", desc: "定时器回调：join+清状态原子完成。", children: [
+        { name: "left/rightWindowState.get(window)", loc: ":248-249", type: "data", desc: "取该 (key, windowEnd) 桶内两侧全量行列表。" },
+        { name: "join(leftData, rightData)", loc: ":250", type: "fn", desc: "虚函数，按 joinType 分派子类。", children: [
+          { name: "InnerJoinOperator.join", loc: ":350", type: "fn", desc: "双层循环 × joinCondition.apply 过滤 × JoinedRowData 输出。" },
+          { name: "FullOuterJoinOperator.join", loc: ":543", type: "fn", desc: "IdentityHashMap 标记已发射右行 + 双向 null padding。" },
+          { name: "LeftOuter / RightOuter", loc: ":427/:474", type: "fn", desc: "单侧无匹配时 null padding 输出。" },
+          { name: "SemiAntiJoinOperator.join", loc: ":287", type: "fn", desc: "存在性判定，isAntiJoin 控制 emit 方向。" } ] },
+        { name: "clear(window) ×2", loc: ":252-257", type: "data", desc: "join 完成即清两侧桶——窗口关闭后桶整体消失，全 INSERT 无撤回。" } ] } ] } ] }
+] },
+
+{ title: "B. Flink-Gluten-Velox 调用链", note: "pull 批级驱动；状态粒度为 RowVectorPtr（向量级）；join 引擎复用 velox NestedLoopJoinProbe。红色【待修】= 开发方案差距项。", children: [
+  { name: "B1. 编译期：gluten 改造版 planner → velox 计划", type: "phase", children: [
+    { name: "StreamExecWindowJoin.translateToPlanInternal（gluten 改造版）", loc: "gluten-flink/planner/.../StreamExecWindowJoin.java:155", type: "fn", desc: "改造版翻译：不建 Java 算子，而是构造 velox 有状态计划交给桥算子。", children: [
+      { name: "LogicalTypeConverter.toVLType ×3", type: "fn", desc: "Flink 行类型转 velox 类型（左/右/输出）。" },
+      { name: "Utils.analyzeJoinKeys + generateJoinEqualCondition", loc: ":186-190", type: "fn", badges: [{cls:"fix", text:"待修4"}], desc: "分析 join 键并生成等值条件——非等值剩余条件（q5 的 num>=maxn）在此丢失。" },
+      { name: "TableScanNode(ExternalStreamTableHandle) ×2", loc: ":192-203", type: "fn", desc: "左右输入声明为外部流扫描——运行时对接 Java 侧阻塞队列。" },
+      { name: "HashPartitionFunctionSpec ×2", loc: ":207-210", type: "fn", desc: "join 键的 hash 分区函数（native 侧 1024 分区）。" },
+      { name: "NestedLoopJoinNode", loc: ":211-218", type: "fn", desc: "构造 probe 计划：velox 原生嵌套循环 join（支持任意条件），joinType 一并传入。" },
+      { name: "StreamWindowJoinNode", loc: ":219-230", type: "fn", desc: "窗口 join 计划节点：双输入 + 分区函数 + probe + 窗口列下标。" },
+      { name: "StatefulPlanNode + new GlutenTwoInputOperator", loc: ":231-241", type: "fn", desc: "包装为有状态计划，创建双输入桥算子（真正的 Flink 算子实例）。" },
+      { name: "TwoInputTransformation + setStateKeySelectors", loc: ":244-266", type: "data", desc: "Flink 层 Transformation 保留剩余键 keyBy——同 key 数据物理同 subtask。" } ] } ] },
+  { name: "B2. 运行期：Java 桥 ↔ JNI ↔ velox", type: "phase", children: [
+    { name: "Java 侧：GlutenTwoInputOperator", loc: "gluten-flink/runtime/.../GlutenTwoInputOperator.java", type: "phase", children: [
+      { name: "open()", loc: ":403-411", type: "fn", desc: "初始化会话与双输入队列，JNI 创建 native task。", children: [
+        { name: "newBlockingQueue ×2", loc: ":403-404", type: "data", desc: "左/右外部流阻塞队列（native TableScan 的数据源）。" },
+        { name: "session.queryOps().execute(query)", loc: ":411", type: "fn", desc: "提交有状态查询，触发 StatefulTask::create。" } ] },
+      { name: "processElement1(element)", loc: ":165", type: "fn", desc: "左流数据：转 StatefulRecord→RowVector 入左队列，然后驱动推进。" },
+      { name: "processElement2(element)", loc: ":178", type: "fn", desc: "右流同构处理。" },
+      { name: "processWatermark1/2(mark)", loc: ":241/:252", type: "fn", desc: "分侧水位线通知 native（带输入序号 0/1），再驱动推进。" },
+      { name: "drainTaskOutput()", loc: ":196", type: "fn", desc: "推进循环：反复驱动 native 直到无输出。", children: [
+        { name: "task.advance()", type: "fn", desc: "JNI 驱动原生推进一步（Available/Blocked/Done）。" },
+        { name: "task.statefulGet()", type: "fn", desc: "取回一个输出元素（水位线/状态/记录）。", children: [
+          { name: "output.emitWatermark / emitWatermarkStatus", type: "data", desc: "水位线与空闲状态回到 Flink 水位线域。" },
+          { name: "outputBridge.collect", type: "data", desc: "记录元素转 RowData 下发给下游算子。" } ] } ] } ] },
+    { name: "JNI 分界", type: "jni", desc: "每次 advance 一次跨语言往返。", children: [
+      { name: "StatefulTask::next", loc: "velox/experimental/stateful/StatefulTask.cpp:117", type: "fn", desc: "拉取式任务推进入口。", children: [
+        { name: "operatorChain_->advanceWithFuture", loc: ":143", type: "fn", desc: "级联推进算子链（链头拉取，输出递归 push 给下游）。" } ] } ] },
+    { name: "velox 装配（open 时一次）", type: "phase", children: [
+      { name: "StatefulPlanner::plan → transformStreamWindowJoinOperator", loc: "StatefulPlanner.cpp:156", type: "fn", desc: "计划树转算子链；识别 StreamWindowJoinNode 构造 WindowJoin。", children: [
+        { name: "transformOperator ×3", type: "fn", desc: "左右输入（外流 TableScan）与 probe（NestedLoopJoinProbe）各转为 velox 算子。" },
+        { name: "new WindowJoin(...)", type: "fn", desc: "构造窗口 join 算子：双输入+双键选择器+probe+窗口列下标。" } ] } ] },
+    { name: "velox 数据面：WindowJoin", loc: "experimental/stateful/WindowJoin.cpp", type: "phase", children: [
+      { name: "advance()", loc: ":78", type: "fn", desc: "每次推进先处理左侧再处理右侧（拉取式双流）。", children: [
+        { name: "processData(left)", loc: ":86", type: "fn", desc: "左侧一个批次处理全流程（右侧同构）。", children: [
+          { name: "input->getOutput()", loc: ":91", type: "data", desc: "从左外部流拉出一个 RowVector（批，非行）。" },
+          { name: "filterWindowFiredRows", loc: ":93", type: "fn", badges: [{cls:"fix", text:"待修2"}], desc: "迟到过滤——当前空实现，直接返回原向量。" },
+          { name: "keySelector->partition", loc: ":94", type: "fn", desc: "按 join 键把向量拆分为 key→子向量（1024 分区）。" },
+          { name: "partitionWindowData", loc: ":96", type: "fn", badges: [{cls:"fix", text:"待修1"}], desc: "按 windowEnd 分桶——当前只读向量首行的 windowEnd，跨窗口批次全进错桶。" },
+          { name: "state->add(key, windowEnd, rowData)", loc: ":98", type: "data", desc: "向量入桶：ListState<(key,windowEnd)→RowVectorPtr>，值为整向量。" },
+          { name: "registerEventTimeTimer(key, windowEnd, windowEnd-1)", loc: ":99", type: "fn", desc: "按 (key,windowEnd) 注册事件时间定时器。" } ] } ] },
+    { name: "水位线 → 定时器 → 配对", type: "phase", children: [
+      { name: "StatefulTask::notifyWatermark(wm, idx)", loc: "StatefulTask.cpp:200", type: "fn", desc: "分侧水位线进入算子链。" },
+      { name: "operatorChain_->processWatermark", type: "fn", badges: [{cls:"warn", text:"待核实R1"}], desc: "双流合并取 min（CombinedWatermarkStatus）后下发——“数据先于水位线”的序在此需验证。" },
+      { name: "WindowJoin::processWatermarkInternal", loc: "WindowJoin.cpp:148", type: "fn", desc: "推进定时器服务，触发到期定时器。" },
+      { name: "WindowJoin::onEventTime", loc: ":129", type: "fn", desc: "定时器回调入口。", children: [
+        { name: "join(key, window)", loc: ":132", type: "fn", desc: "桶配对主流程。", children: [
+          { name: "get(key, window) ×2", type: "data", desc: "取两侧桶内全部 RowVector。" },
+          { name: "empty 短路", type: "data", badges: [{cls:"fix", text:"待修3"}], desc: "任一侧为空直接 return——外连接/Semi/Anti 语义缺失（joinType 未在桶级消费）。" },
+          { name: "probe_->addInput + setBuildData", type: "fn", desc: "左侧向量作 probe 逐个喂入，右侧全部向量作 build 侧。" },
+          { name: "probe_->getOutput()", type: "fn", desc: "NestedLoopJoinProbe 按条件（当前仅等值）做配对并输出结果向量。" },
+          { name: "pushOutput(StreamRecord)", type: "data", desc: "输出推进到链尾并进入 pendings_，等 Java statefulGet 取走。" },
+          { name: "remove(key, window) ×2", type: "data", desc: "配对完成清两侧桶（与原生 join+clear 语义一致）。" } ] } ] } ] } ] }
+    ] } ] },
+
+{ title: "C. 两链对照", table: [
+  ["维度", "Flink 原生", "GFV", "影响"],
+  ["驱动模型", "push（每行 processElement）", "pull（Java 入队→native 拉批 RowVector）", "GFV 状态粒度是向量级；外连接记录级标记需重新设计（阶段 3 难点）"],
+  ["剩余条件", "codegen GeneratedJoinCondition", "NestedLoopJoinNode 条件（当前仅等值拼接）", "待修4：非等值并入 probe 条件即得 q5"],
+  ["join 类型", "6 子类显式实现", "probe 携 joinType + 桶级短路", "待修3：短路破坏外连接"],
+  ["分区对齐", "Flink keyBy（剩余键 hash）", "Flink keyBy 保留 + native KeySelector 1024 分区", "双层分区，R2 待核"],
+  ["水位线", "InternalTimerService 直推", "桥 notifyWatermark(idx)→链式→timerService", "R1：双流取 min 与数据先于水位线序待证"],
+  ["状态", "keyed State + ns=windowEnd，行级", "stateHandler ListState，向量级", "同构 (key,ns)；粒度差异是外连接主要适配点"],
+] }
+];
+
+function renderNode(n) {
+  const hasKids = n.children && n.children.length;
+  const leaf = !hasKids;
+  const badges = (n.badges||[]).map(b=>`<span class="badge ${b.cls}">${b.text}</span>`).join(" ");
+  const loc = n.loc ? `<span class="loc">${n.loc}</span>` : "";
+  const desc = n.desc ? `<div class="desc">${n.desc}</div>` : "";
+  const kids = hasKids ? `<div class="children">${n.children.map(renderNode).join("")}</div>` : "";
+  return `<div class="node t-${n.type||"fn"}${hasKids?"":" leaf"}" ${hasKids?"data-open='1'":""}>
+    <div class="row" ${hasKids?"onclick=\"toggle(event,this)\"":""}>
+      <span class="toggle">${hasKids?"▼":""}</span>
+      <span class="name">${n.name}</span>${loc}${badges}
+    </div>${desc}${kids}</div>`;
+}
+
+function toggle(ev, row) {
+  if (ev.target.classList.contains("name") || ev.target.classList.contains("loc") || ev.target.classList.contains("badge") || ev.target.parentElement === row) {
+    const node = row.parentElement;
+    const open = node.dataset.open === "1";
+    node.dataset.open = open ? "0" : "1";
+    node.classList.toggle("collapsed", open);
+    row.querySelector(".toggle").textContent = open ? "▶" : "▼";
+  }
+}
+
+function render() {
+  const root = document.getElementById("root");
+  root.innerHTML = DATA.map(chain => {
+    if (chain.table) {
+      const rows = chain.table.map((r,i)=> i===0
+        ? `<tr>${r.map(c=>`<th>${c}</th>`).join("")}</tr>`
+        : `<tr>${r.map(c=>`<td>${c}</td>`).join("")}</tr>`).join("");
+      return `<div class="chain"><h2 onclick="this.parentElement.classList.toggle('collapsed')"><span class="arrow">▼</span>${chain.title}</h2>
+        <div class="body"><table>${rows}</table></div></div>`;
+    }
+    const body = (chain.note?`<div class="note">${chain.note}</div>`:"") + chain.children.map(renderNode).join("");
+    return `<div class="chain"><h2 onclick="this.parentElement.classList.toggle('collapsed')"><span class="arrow">▼</span>${chain.title}</h2>
+      <div class="body">${body}</div></div>`;
+  }).join("");
+}
+
+function setAll(open) {
+  document.querySelectorAll(".node").forEach(n => {
+    if (n.querySelector(".children")) {
+      n.dataset.open = open ? "1" : "0";
+      n.classList.toggle("collapsed", !open);
+      n.querySelector(".toggle").textContent = open ? "▼" : "▶";
+    }
+  });
+}
+
+render();
+// 默认展开到第 2 层（收起更深）
+setTimeout(() => {
+  document.querySelectorAll(".children .children").forEach(c => {
+    const n = c.closest(".node");
+    if (n && !n.closest(".children .children .children")) {
+      n.dataset.open = "0"; n.classList.add("collapsed");
+      n.querySelector(".toggle").textContent = "▶";
+    }
+  });
+}, 0);
+</script>
+</body>
+</html>
